@@ -1,119 +1,100 @@
 import os
 import json
 import base64
+import cv2
+import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from groq import Groq
+from ultralytics import YOLO
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+# Allow CORS for local testing
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # --- CONFIGURATION ---
-# Use environment variable for API Key
-os.environ["GROQ_API_KEY"] = os.environ.get("GROQ_API_KEY", "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")
+MODEL_PATH = "best.pt"  # Your custom trained model
 
-client = Groq(
-    api_key=os.environ.get("GROQ_API_KEY"),
-)
-
-# --- ADVANCED SYSTEM PROMPT FOR ACCURACY ---
-SYSTEM_INSTRUCTION = """
-You are a highly specialized Forestry AI trained for precision urban tree inventory. 
-Your task is to analyze aerial or street-level imagery to detect individual trees and assess their health.
-
-**CRITICAL INSTRUCTIONS:**
-1.  **Detection Strategy:**
-    -   Do NOT draw one large box around a forest or group of trees.
-    -   Identify DISTINCT, INDIVIDUAL tree crowns.
-    -   Ignore bushes, grass, or low-lying vegetation. Only detect trees.
-    -   If trees overlap, try to estimate the center mass of each distinct crown.
-
-2.  **Health Assessment Criteria:**
-    -   **Healthy:** Deep green, full canopy, no visible discoloration.
-    -   **Stressed:** Yellowing leaves, brown patches, thinning canopy, or pale green color.
-    -   **Dead:** Gray/brown branches with no leaves, skeletal appearance, or completely brown canopy.
-
-3.  **Coordinate Precision:**
-    -   Output bounding boxes in [ymin, xmin, ymax, xmax] format.
-    -   Coordinates must be normalized integers from 0 to 1000.
-    -   Ensure boxes are tight around the visible crown.
-
-**OUTPUT FORMAT:**
-Return ONLY a valid JSON object. Do not include markdown formatting like ```json or ```.
-Structure:
-{
-  "trees": [
-    {
-      "box": [ymin, xmin, ymax, xmax],
-      "health": "healthy" | "stressed" | "dead",
-      "confidence": float (0.0 to 1.0)
-    }
-  ],
-  "lowGreenCoverDescription": "Brief analysis of the green cover density and any replanting recommendations."
-}
-"""
-
-def get_vision_model():
-    """Dynamically finds a working vision model to avoid deprecation errors."""
-    try:
-        models = client.models.list()
-        vision_models = [m.id for m in models.data if 'vision' in m.id]
-        
-        # Prefer 90b (smartest), then 11b, then whatever is available
-        for m in vision_models:
-            if '90b' in m: return m
-        if vision_models: return vision_models[0]
-    except:
-        pass
-    return "llama-3.2-90b-vision-preview" 
+# Initialize Model
+print(f"🔄 Loading Local Model: {MODEL_PATH}...")
+try:
+    if os.path.exists(MODEL_PATH):
+        model = YOLO(MODEL_PATH)
+        print("✅ Model Loaded Successfully!")
+    else:
+        # Fallback to standard YOLO if custom one isn't there yet
+        print(f"⚠️ '{MODEL_PATH}' not found. Downloading standard YOLOv8n for testing...")
+        model = YOLO("yolov8n.pt")
+        print("✅ Standard YOLOv8n Loaded (It might detect people/cars instead of trees until you train it!)")
+except Exception as e:
+    print(f"❌ Error loading model: {e}")
+    model = None
 
 @app.route('/')
 def home():
-    return "ReLeaf Backend (Optimized Groq AI) is Running! 🌲"
+    return "ReLeaf Local AI Server is Running! 🌲"
 
-@app.route('/analyze', methods=['POST', 'OPTIONS'])
+@app.route('/analyze', methods=['POST'])
 def analyze_image():
-    if request.method == 'OPTIONS':
-        return jsonify({}), 200
+    if not model:
+        return jsonify({"error": "Model not active."}), 500
 
     try:
+        # 1. Receive Image
         data = request.json
-        if not data:
-             return jsonify({"error": "No JSON received"}), 400
-             
-        img_data = data.get('image', '')
-        if "data:image" not in img_data:
-             base64_image = f"data:image/jpeg;base64,{img_data}"
-        else:
-             base64_image = img_data
+        if not data or 'image' not in data:
+            return jsonify({"error": "No image data"}), 400
 
-        active_model = get_vision_model()
-        print(f"Using model: {active_model}")
+        # 2. Decode Base64
+        img_str = data['image']
+        if "base64," in img_str:
+            img_str = img_str.split("base64,")[1]
+        
+        img_bytes = base64.b64decode(img_str)
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": SYSTEM_INSTRUCTION},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Analyze this image. Detect individual trees and assess health."},
-                        {"type": "image_url", "image_url": {"url": base64_image}}
-                    ]
-                }
-            ],
-            model=active_model,
-            temperature=0.1, # Low temperature for more factual/precise results
-            max_tokens=2048,
-            response_format={"type": "json_object"}, 
-        )
+        # 3. Run YOLO Inference
+        # conf=0.15 low confidence threshold to catch more trees
+        results = model.predict(img, conf=0.15) 
 
-        result = json.loads(chat_completion.choices[0].message.content)
-        return jsonify(result)
+        # 4. Format Results for Frontend
+        detected_objects = []
+        result = results[0]
+        
+        img_h, img_w = img.shape[:2]
+
+        for box, score, cls in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.conf.cpu().numpy(), result.boxes.cls.cpu().numpy()):
+            x1, y1, x2, y2 = box.astype(int)
+            
+            # Normalize to 0-1000 scale
+            # Frontend expects: [ymin, xmin, ymax, xmax]
+            norm_box = [
+                int((y1 / img_h) * 1000),
+                int((x1 / img_w) * 1000),
+                int((y2 / img_h) * 1000),
+                int((x2 / img_w) * 1000)
+            ]
+
+            # Health Logic (Simulated based on confidence)
+            # In a real custom model, you could train classes like "healthy_tree", "dead_tree"
+            health = "healthy"
+            if score < 0.6: health = "stressed"
+            if score < 0.3: health = "dead"
+
+            detected_objects.append({
+                "box": norm_box,
+                "health": health
+            })
+
+        return jsonify({
+            "trees": detected_objects,
+            "lowGreenCoverDescription": f"Local AI Analysis: Detected {len(detected_objects)} objects."
+        })
 
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    print("🚀 Server starting on http://127.0.0.1:5000")
+    app.run(debug=True, port=5000)
