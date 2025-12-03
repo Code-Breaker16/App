@@ -1,5 +1,6 @@
 flask
 flask-cors
 ultralytics
+groq
 opencv-python-headless
 gunicorn
